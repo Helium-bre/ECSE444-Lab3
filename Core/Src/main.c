@@ -36,6 +36,13 @@
 #define SAMPLE_RATE_HZ  8000u  /* DAC samples per second */
 #define WAVE_PERIOD     120u   /* samples per cycle -> tone = SAMPLE_RATE_HZ / WAVE_PERIOD */
 
+/* Sine on DAC1, driven by the TIM2 interrupt.
+   Tone frequency = SINE_TIMER_HZ / SINE_SAMPLES = 8000 / 16 = 500 Hz. */
+#define SINE_TIMER_HZ   16000u  /* TIM2 interrupts per second (must be > tone frequency) */
+#define SINE_SAMPLES    16u    /* samples stored for exactly one period (2*pi) */
+#define SINE_CENTER     2048.0f            /* middle of the 12-bit range */
+#define SINE_AMPLITUDE  (WAVE_MAX / 3.0f)  /* +/-1365 -> swings over ~2/3 of the range */
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -46,14 +53,20 @@
 /* Private variables ---------------------------------------------------------*/
 DAC_HandleTypeDef hdac1;
 
+TIM_HandleTypeDef htim2;
+
 /* USER CODE BEGIN PV */
 /* Last values sent to the DAC. Global + volatile so the SWV Data Trace
    Timeline Graph can watch them (they need a fixed address in RAM). */
 volatile uint16_t triangle_value;
 volatile uint16_t sawtooth_value;
-/* Sine from arm_sin_f32(), scaled to 0..4095 like the other waves.
+/* Last sine sample sent to DAC1 (from sine_table).
    Kept as an integer because the SWV graph shows raw integers, not floats. */
 volatile uint16_t sine_value;
+
+/* One full sine period, filled once at startup with arm_sin_f32(). */
+uint16_t sine_table[SINE_SAMPLES];
+volatile uint32_t sine_index = 0;
 
 /* USER CODE END PV */
 
@@ -61,6 +74,7 @@ volatile uint16_t sine_value;
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_DAC1_Init(void);
+static void MX_TIM2_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -100,9 +114,23 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_DAC1_Init();
+  MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
-  HAL_DAC_Start(&hdac1, DAC_CHANNEL_1);  /* PA4: triangle wave */
-  HAL_DAC_Start(&hdac1, DAC_CHANNEL_2);  /* PA5: sawtooth wave */
+  HAL_DAC_Start(&hdac1, DAC_CHANNEL_1);  /* PA4: sine (TIM2 interrupt) */
+  HAL_DAC_Start(&hdac1, DAC_CHANNEL_2);  /* PA5: sawtooth (main loop) */
+
+  /* Fill the table with one period: angles 0 .. 2*pi*(N-1)/N.
+     The next sample after the last one is angle 2*pi = 0, so it loops without a jump. */
+  for (uint32_t k = 0; k < SINE_SAMPLES; k++)
+  {
+    float32_t angle = 2.0f * PI * (float32_t)k / (float32_t)SINE_SAMPLES;
+    sine_table[k] = (uint16_t)(SINE_CENTER + SINE_AMPLITUDE * arm_sin_f32(angle));
+  }
+
+  /* TIM2 counts at the CPU clock; set it to overflow SINE_TIMER_HZ times per second. */
+  __HAL_TIM_SET_AUTORELOAD(&htim2, (SystemCoreClock / SINE_TIMER_HZ) - 1u);
+  __HAL_TIM_SET_COUNTER(&htim2, 0);
+  HAL_TIM_Base_Start_IT(&htim2);
 
   /* Use the CPU cycle counter to space the samples evenly. */
   CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
@@ -123,9 +151,7 @@ int main(void)
     /* USER CODE BEGIN 3 */
     triangle_value = triangle_wave(i, WAVE_PERIOD);
     sawtooth_value = sawtooth_wave(i, WAVE_PERIOD);
-    float32_t angle = 2.0f * PI * (float32_t)(i % WAVE_PERIOD) / (float32_t)WAVE_PERIOD;
-    sine_value = (uint16_t)((arm_sin_f32(angle) + 1.0f) * (WAVE_MAX / 2.0f));
-    HAL_DAC_SetValue(&hdac1, DAC_CHANNEL_1, DAC_ALIGN_12B_R, sine_value);
+    /* DAC1 (sine) is updated by HAL_TIM_PeriodElapsedCallback(). */
     HAL_DAC_SetValue(&hdac1, DAC_CHANNEL_2, DAC_ALIGN_12B_R, sawtooth_value);
     i++;
 
@@ -232,6 +258,51 @@ static void MX_DAC1_Init(void)
 }
 
 /**
+  * @brief TIM2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM2_Init(void)
+{
+
+  /* USER CODE BEGIN TIM2_Init 0 */
+
+  /* USER CODE END TIM2_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM2_Init 1 */
+
+  /* USER CODE END TIM2_Init 1 */
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 0;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 499;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_UPDATE;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM2_Init 2 */
+
+  /* USER CODE END TIM2_Init 2 */
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -263,11 +334,57 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(led_GPIO_Port, &GPIO_InitStruct);
 
+  /* EXTI interrupt init*/
+  HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
+
 /* USER CODE BEGIN MX_GPIO_Init_2 */
 /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
+/**
+  * @brief  Period elapsed callback (overrides the weak HAL version).
+  *         Called by HAL_TIM_IRQHandler() every time TIM2 overflows.
+  * @param  htim Timer that triggered the interrupt.
+  * @retval None
+  */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  if (htim->Instance == TIM2)
+  {
+    sine_value = sine_table[sine_index];
+    HAL_DAC_SetValue(&hdac1, DAC_CHANNEL_1, DAC_ALIGN_12B_R, sine_value);
+
+    sine_index++;
+    if (sine_index >= SINE_SAMPLES)
+    {
+      sine_index = 0;
+    }
+  }
+}
+
+/**
+  * @brief  EXTI line detection callback (overrides the weak HAL version).
+  *         Called by HAL_GPIO_EXTI_IRQHandler() when the button is pressed.
+  * @param  GPIO_Pin Pin that triggered the interrupt.
+  * @retval None
+  */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+  static uint32_t last_press_ms = 0;
+
+  if (GPIO_Pin == button_Pin)
+  {
+    /* Ignore contact bounce: one toggle per click. */
+    uint32_t now = HAL_GetTick();
+    if (now - last_press_ms >= 200u)
+    {
+      last_press_ms = now;
+      HAL_GPIO_TogglePin(led_GPIO_Port, led_Pin);
+    }
+  }
+}
 
 /* USER CODE END 4 */
 
