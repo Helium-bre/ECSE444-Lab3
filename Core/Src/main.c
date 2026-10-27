@@ -22,6 +22,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "waveform.h"
+#include "arm_math.h"
 
 /* USER CODE END Includes */
 
@@ -32,6 +33,8 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define SAMPLE_RATE_HZ  8000u  /* DAC samples per second */
+#define WAVE_PERIOD     120u   /* samples per cycle -> tone = SAMPLE_RATE_HZ / WAVE_PERIOD */
 
 /* USER CODE END PD */
 
@@ -44,6 +47,13 @@
 DAC_HandleTypeDef hdac1;
 
 /* USER CODE BEGIN PV */
+/* Last values sent to the DAC. Global + volatile so the SWV Data Trace
+   Timeline Graph can watch them (they need a fixed address in RAM). */
+volatile uint16_t triangle_value;
+volatile uint16_t sawtooth_value;
+/* Sine from arm_sin_f32(), scaled to 0..4095 like the other waves.
+   Kept as an integer because the SWV graph shows raw integers, not floats. */
+volatile uint16_t sine_value;
 
 /* USER CODE END PV */
 
@@ -91,6 +101,16 @@ int main(void)
   MX_GPIO_Init();
   MX_DAC1_Init();
   /* USER CODE BEGIN 2 */
+  HAL_DAC_Start(&hdac1, DAC_CHANNEL_1);  /* PA4: triangle wave */
+  HAL_DAC_Start(&hdac1, DAC_CHANNEL_2);  /* PA5: sawtooth wave */
+
+  /* Use the CPU cycle counter to space the samples evenly. */
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->CYCCNT = 0;
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+  const uint32_t cycles_per_sample = SystemCoreClock / SAMPLE_RATE_HZ;
+  uint32_t next_sample = DWT->CYCCNT;
+  uint32_t i = 0;
 
   /* USER CODE END 2 */
 
@@ -101,6 +121,17 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    triangle_value = triangle_wave(i, WAVE_PERIOD);
+    sawtooth_value = sawtooth_wave(i, WAVE_PERIOD);
+    float32_t angle = 2.0f * PI * (float32_t)(i % WAVE_PERIOD) / (float32_t)WAVE_PERIOD;
+    sine_value = (uint16_t)((arm_sin_f32(angle) + 1.0f) * (WAVE_MAX / 2.0f));
+    HAL_DAC_SetValue(&hdac1, DAC_CHANNEL_1, DAC_ALIGN_12B_R, sine_value);
+    HAL_DAC_SetValue(&hdac1, DAC_CHANNEL_2, DAC_ALIGN_12B_R, sawtooth_value);
+    i++;
+
+    /* Wait until it's time for the next sample. */
+    next_sample += cycles_per_sample;
+    while ((int32_t)(DWT->CYCCNT - next_sample) < 0) { }
   }
   /* USER CODE END 3 */
 }

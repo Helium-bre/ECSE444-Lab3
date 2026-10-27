@@ -1,0 +1,2 @@
+../Core/Src/waveform.c:4:10:triangle_wave	24	static
+../Core/Src/waveform.c:19:10:sawtooth_wave	24	static
