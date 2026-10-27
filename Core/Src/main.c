@@ -36,10 +36,10 @@
 #define SAMPLE_RATE_HZ  8000u  /* DAC samples per second */
 #define WAVE_PERIOD     120u   /* samples per cycle -> tone = SAMPLE_RATE_HZ / WAVE_PERIOD */
 
-/* Sine on DAC1, driven by the TIM2 interrupt.
-   Tone frequency = SINE_TIMER_HZ / SINE_SAMPLES = 8000 / 16 = 500 Hz. */
-#define SINE_TIMER_HZ   16000u  /* TIM2 interrupts per second (must be > tone frequency) */
-#define SINE_SAMPLES    16u    /* samples stored for exactly one period (2*pi) */
+/* Sine on DAC1: TIM2 triggers the DAC, DMA feeds it from sine_table (no CPU).
+   Tone frequency = TIM2 rate / SINE_SAMPLES. The button cycles through TONES_HZ. */
+#define SINE_SAMPLES    32u    /* samples stored for exactly one period (2*pi) */
+#define NUM_TONES       3u
 #define SINE_CENTER     2048.0f            /* middle of the 12-bit range */
 #define SINE_AMPLITUDE  (WAVE_MAX / 3.0f)  /* +/-1365 -> swings over ~2/3 of the range */
 
@@ -52,6 +52,7 @@
 
 /* Private variables ---------------------------------------------------------*/
 DAC_HandleTypeDef hdac1;
+DMA_HandleTypeDef hdma_dac1_ch1;
 
 TIM_HandleTypeDef htim2;
 
@@ -60,19 +61,22 @@ TIM_HandleTypeDef htim2;
    Timeline Graph can watch them (they need a fixed address in RAM). */
 volatile uint16_t triangle_value;
 volatile uint16_t sawtooth_value;
-/* Last sine sample sent to DAC1 (from sine_table).
-   Kept as an integer because the SWV graph shows raw integers, not floats. */
-volatile uint16_t sine_value;
 
-/* One full sine period, filled once at startup with arm_sin_f32(). */
+/* One full sine period, filled once at startup with arm_sin_f32().
+   The DMA reads it in a loop and sends one value to DAC1 per TIM2 trigger. */
 uint16_t sine_table[SINE_SAMPLES];
-volatile uint32_t sine_index = 0;
+
+/* Arpeggio played by the button: C6, E6, G6. */
+const float32_t TONES_HZ[NUM_TONES] = { 1046.50f, 1318.51f, 1567.98f };
+uint32_t tone_reload[NUM_TONES];   /* TIM2 auto-reload value for each tone */
+volatile uint32_t tone_index = 0;  /* current tone (traceable in SWV) */
 
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_DAC1_Init(void);
 static void MX_TIM2_Init(void);
 /* USER CODE BEGIN PFP */
@@ -113,10 +117,10 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_DAC1_Init();
   MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
-  HAL_DAC_Start(&hdac1, DAC_CHANNEL_1);  /* PA4: sine (TIM2 interrupt) */
   HAL_DAC_Start(&hdac1, DAC_CHANNEL_2);  /* PA5: sawtooth (main loop) */
 
   /* Fill the table with one period: angles 0 .. 2*pi*(N-1)/N.
@@ -127,10 +131,22 @@ int main(void)
     sine_table[k] = (uint16_t)(SINE_CENTER + SINE_AMPLITUDE * arm_sin_f32(angle));
   }
 
-  /* TIM2 counts at the CPU clock; set it to overflow SINE_TIMER_HZ times per second. */
-  __HAL_TIM_SET_AUTORELOAD(&htim2, (SystemCoreClock / SINE_TIMER_HZ) - 1u);
+  /* TIM2 counts at the CPU clock and must overflow (tone * SINE_SAMPLES) times per second. */
+  for (uint32_t t = 0; t < NUM_TONES; t++)
+  {
+    float32_t ticks = (float32_t)SystemCoreClock / (TONES_HZ[t] * SINE_SAMPLES);
+    tone_reload[t] = (uint32_t)(ticks + 0.5f) - 1u;
+  }
+  __HAL_TIM_SET_AUTORELOAD(&htim2, tone_reload[tone_index]);
   __HAL_TIM_SET_COUNTER(&htim2, 0);
-  HAL_TIM_Base_Start_IT(&htim2);
+  /* Auto-reload preload: a new tone takes effect at the end of the current timer
+     period, so changing it from the button never glitches the counter. */
+  SET_BIT(htim2.Instance->CR1, TIM_CR1_ARPE);
+
+  /* PA4: DMA copies sine_table to DAC1 in a loop, one value per TIM2 trigger. */
+  HAL_DAC_Start_DMA(&hdac1, DAC_CHANNEL_1, (uint32_t *)sine_table, SINE_SAMPLES, DAC_ALIGN_12B_R);
+  /* No _IT: the timer only triggers the DAC; an interrupt per sample is not needed. */
+  HAL_TIM_Base_Start(&htim2);
 
   /* Use the CPU cycle counter to space the samples evenly. */
   CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
@@ -151,7 +167,7 @@ int main(void)
     /* USER CODE BEGIN 3 */
     triangle_value = triangle_wave(i, WAVE_PERIOD);
     sawtooth_value = sawtooth_wave(i, WAVE_PERIOD);
-    /* DAC1 (sine) is updated by HAL_TIM_PeriodElapsedCallback(). */
+    /* DAC1 (sine) is fed by DMA, no CPU work needed here. */
     HAL_DAC_SetValue(&hdac1, DAC_CHANNEL_2, DAC_ALIGN_12B_R, sawtooth_value);
     i++;
 
@@ -235,7 +251,7 @@ static void MX_DAC1_Init(void)
   /** DAC channel OUT1 config
   */
   sConfig.DAC_SampleAndHold = DAC_SAMPLEANDHOLD_DISABLE;
-  sConfig.DAC_Trigger = DAC_TRIGGER_NONE;
+  sConfig.DAC_Trigger = DAC_TRIGGER_T2_TRGO;
   sConfig.DAC_HighFrequency = DAC_HIGH_FREQUENCY_INTERFACE_MODE_DISABLE;
   sConfig.DAC_OutputBuffer = DAC_OUTPUTBUFFER_ENABLE;
   sConfig.DAC_ConnectOnChipPeripheral = DAC_CHIPCONNECT_DISABLE;
@@ -247,6 +263,7 @@ static void MX_DAC1_Init(void)
 
   /** DAC channel OUT2 config
   */
+  sConfig.DAC_Trigger = DAC_TRIGGER_NONE;
   if (HAL_DAC_ConfigChannel(&hdac1, &sConfig, DAC_CHANNEL_2) != HAL_OK)
   {
     Error_Handler();
@@ -303,6 +320,23 @@ static void MX_TIM2_Init(void)
 }
 
 /**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMAMUX1_CLK_ENABLE();
+  __HAL_RCC_DMA1_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA1_Channel3_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel3_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel3_IRQn);
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -343,26 +377,26 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-/**
-  * @brief  Period elapsed callback (overrides the weak HAL version).
-  *         Called by HAL_TIM_IRQHandler() every time TIM2 overflows.
-  * @param  htim Timer that triggered the interrupt.
-  * @retval None
-  */
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
-{
-  if (htim->Instance == TIM2)
-  {
-    sine_value = sine_table[sine_index];
-    HAL_DAC_SetValue(&hdac1, DAC_CHANNEL_1, DAC_ALIGN_12B_R, sine_value);
+// /**
+//   * @brief  Period elapsed callback (overrides the weak HAL version).
+//   *         Called by HAL_TIM_IRQHandler() every time TIM2 overflows.
+//   * @param  htim Timer that triggered the interrupt.
+//   * @retval None
+//   */
+// void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+// {
+//   if (htim->Instance == TIM2)
+//   {
+//     sine_value = sine_table[sine_index];
+//     HAL_DAC_SetValue(&hdac1, DAC_CHANNEL_1, DAC_ALIGN_12B_R, sine_value);
 
-    sine_index++;
-    if (sine_index >= SINE_SAMPLES)
-    {
-      sine_index = 0;
-    }
-  }
-}
+//     sine_index++;
+//     if (sine_index >= SINE_SAMPLES)
+//     {
+//       sine_index = 0;
+//     }
+//   }
+// }
 
 /**
   * @brief  EXTI line detection callback (overrides the weak HAL version).
@@ -376,12 +410,17 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 
   if (GPIO_Pin == button_Pin)
   {
-    /* Ignore contact bounce: one toggle per click. */
+    /* Ignore contact bounce: one action per click. */
     uint32_t now = HAL_GetTick();
     if (now - last_press_ms >= 200u)
     {
       last_press_ms = now;
       HAL_GPIO_TogglePin(led_GPIO_Port, led_Pin);
+
+      /* Next note of the arpeggio: only the timer rate changes,
+         the DMA keeps playing the same sine table. */
+      tone_index = (tone_index + 1u) % NUM_TONES;
+      __HAL_TIM_SET_AUTORELOAD(&htim2, tone_reload[tone_index]);
     }
   }
 }
